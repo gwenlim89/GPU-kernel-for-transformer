@@ -186,6 +186,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         if valid_token_mask is None:
             return False
 
+        # Most no-padding benchmark cases still pass an all-True mask. Checking
+        # once lets the CUDA path skip mask construction and masked_fill work.
         # The benchmark reuses the same fixed mask during timing. Cache the
         # all-valid check so CUDA runs avoid a device synchronization per layer.
         cache_key = (
@@ -207,6 +209,8 @@ class UserOptimizedTransformer(BaselineTransformer):
     def _packed_qkv(
         attention: BaselineSelfAttention,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The baseline launches three separate Linear ops for Q, K, and V. Stack
+        # those weights once so inference can compute QKV with one larger GEMM.
         q_proj = attention.q_proj
         k_proj = attention.k_proj
         v_proj = attention.v_proj
@@ -224,6 +228,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
         cached_qkv = getattr(attention, "_optimized_qkv_cache", None)
         if cached_qkv is None or cached_qkv[0] != cache_key:
+            # These cached tensors are derived from the existing parameters, so
+            # parameter names stay compatible with the benchmark weight copier.
             weight = torch.cat(
                 (q_proj.weight, k_proj.weight, v_proj.weight), dim=0
             ).contiguous()
@@ -243,6 +249,9 @@ class UserOptimizedTransformer(BaselineTransformer):
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         qkv_weight, qkv_bias = self._packed_qkv(attention)
+
+        # One packed projection cuts launch overhead and memory traffic compared
+        # with separate q_proj/k_proj/v_proj calls.
         qkv = F.linear(x, qkv_weight, qkv_bias)
         qkv = qkv.view(
             batch, seq_len, 3, attention.num_heads, attention.head_dim
@@ -252,6 +261,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         attn_mask = None
         is_causal = self.config.causal
         if has_padding:
+            # SDPA bool masks use True for positions that are allowed to attend.
+            # This matches the baseline, which only masks invalid key positions.
             key_mask = valid_token_mask[:, None, None, :]
             if self.config.causal:
                 causal_mask = torch.ones(
@@ -262,6 +273,8 @@ class UserOptimizedTransformer(BaselineTransformer):
             else:
                 attn_mask = key_mask
 
+        # On NVIDIA GPUs this can route to fused/memory-efficient attention
+        # kernels instead of materializing the full [B, H, S, S] scores/probs.
         context = F.scaled_dot_product_attention(
             q,
             k,
@@ -273,6 +286,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         context = context.transpose(1, 2).reshape(batch, seq_len, attention.d_model)
         output = attention.out_proj(context)
         if has_padding:
+            # Keep invalid query positions zeroed exactly like the reference.
             output = output.masked_fill(~valid_token_mask[..., None], 0)
         return output
 
@@ -283,6 +297,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         valid_token_mask: Optional[torch.Tensor],
         has_padding: bool,
     ) -> torch.Tensor:
+        # Preserve the reference block formula while swapping in the faster
+        # attention implementation: LN -> attention -> residual, then FFN.
         x = x + self._fast_attention(
             layer.attention, layer.norm1(x), valid_token_mask, has_padding
         )
@@ -310,6 +326,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         if x.device.type != "cuda":
             return super().forward(x, valid_token_mask)
 
+        # Compute the padding status once for the whole model. In the common
+        # all-valid case this skips per-layer mask creation and masked writes.
         has_padding = self._mask_has_padding(valid_token_mask)
         for layer in self.layers:
             x = self._fast_block(layer, x, valid_token_mask, has_padding)
