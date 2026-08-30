@@ -182,6 +182,70 @@ class UserOptimizedTransformer(BaselineTransformer):
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
 
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config)
+        # Caching is opt-in: ordinary forward calls retain full-sequence
+        # semantics, while cached calls return outputs for only the new tokens.
+        self._kv_cache_enabled = False
+        self._kv_cache: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._kv_cache_length = 0
+
+    def enable_kv_cache(self, enabled: bool = True) -> None:
+        """Enable incremental decoding, clearing any previous sequence."""
+        if enabled and not self.config.causal:
+            raise ValueError("KV caching requires a causal Transformer")
+        if enabled and self.training:
+            raise RuntimeError("call eval() before enabling the KV cache")
+        self._kv_cache_enabled = enabled
+        self.reset_kv_cache()
+
+    def reset_kv_cache(self) -> None:
+        """Clear cached keys and values before starting a new sequence."""
+        self._kv_cache.clear()
+        self._kv_cache_length = 0
+
+    @property
+    def kv_cache_length(self) -> int:
+        return self._kv_cache_length
+
+    def _append_kv_cache(
+        self,
+        attention: BaselineSelfAttention,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        batch, heads, chunk_length, head_dim = k.shape
+        start = self._kv_cache_length
+        end = start + chunk_length
+        if end > self.config.seq_len:
+            raise ValueError(
+                f"KV cache capacity exceeded ({end} > {self.config.seq_len})"
+            )
+
+        expected_shape = (batch, heads, self.config.seq_len, head_dim)
+        cache_key = id(attention)
+        cached = self._kv_cache.get(cache_key)
+        if cached is None:
+            cached = (
+                torch.empty(expected_shape, device=k.device, dtype=k.dtype),
+                torch.empty(expected_shape, device=v.device, dtype=v.dtype),
+            )
+            self._kv_cache[cache_key] = cached
+        elif (
+            cached[0].shape != expected_shape
+            or cached[0].device != k.device
+            or cached[0].dtype != k.dtype
+        ):
+            raise RuntimeError(
+                "KV cache does not match this input; reset it before changing "
+                "batch size, device, or dtype"
+            )
+
+        cached_k, cached_v = cached
+        cached_k[:, :, start:end].copy_(k)
+        cached_v[:, :, start:end].copy_(v)
+        return cached_k[:, :, :end], cached_v[:, :, :end], start
+
     def _mask_has_padding(self, valid_token_mask: Optional[torch.Tensor]) -> bool:
         if valid_token_mask is None:
             return False
@@ -260,7 +324,26 @@ class UserOptimizedTransformer(BaselineTransformer):
 
         attn_mask = None
         is_causal = self.config.causal
-        if has_padding:
+        if self._kv_cache_enabled:
+            k, v, query_start = self._append_kv_cache(attention, k, v)
+            key_length = k.shape[-2]
+            if query_start == 0:
+                # Prompt prefill begins at position zero, matching SDPA's
+                # built-in causal-mask alignment.
+                is_causal = True
+            elif seq_len == 1:
+                # Every cached position is valid for the newest single token.
+                is_causal = False
+            else:
+                query_positions = query_start + torch.arange(
+                    seq_len, device=x.device
+                )
+                key_positions = torch.arange(key_length, device=x.device)
+                attn_mask = (
+                    key_positions[None, :] <= query_positions[:, None]
+                )[None, None, :, :]
+                is_causal = False
+        elif has_padding:
             # SDPA bool masks use True for positions that are allowed to attend.
             # This matches the baseline, which only masks invalid key positions.
             key_mask = valid_token_mask[:, None, None, :]
@@ -324,13 +407,21 @@ class UserOptimizedTransformer(BaselineTransformer):
         # Keep a baseline fallback for Mac/CPU runs; use the faster SDPA path
         # on CUDA, where the RTX 3060 Laptop GPU can benefit from fused kernels.
         if x.device.type != "cuda":
+            if self._kv_cache_enabled:
+                raise RuntimeError("KV caching is implemented for CUDA inference")
             return super().forward(x, valid_token_mask)
+
+        if self._kv_cache_enabled and valid_token_mask is not None:
+            if not bool(valid_token_mask.all().item()):
+                raise ValueError("KV-cached decoding does not support padding")
 
         # Compute the padding status once for the whole model. In the common
         # all-valid case this skips per-layer mask creation and masked writes.
         has_padding = self._mask_has_padding(valid_token_mask)
         for layer in self.layers:
             x = self._fast_block(layer, x, valid_token_mask, has_padding)
+        if self._kv_cache_enabled:
+            self._kv_cache_length += x.shape[1]
         x = self.final_norm(x)
         if has_padding:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
