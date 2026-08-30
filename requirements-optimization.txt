@@ -1,0 +1,4 @@
+# Optional kernels used by the optimized CUDA path. The benchmark retains a
+# native PyTorch fallback when Triton is unavailable.
+triton-windows==3.7.1.post27; platform_system == "Windows"
+triton>=3.7,<3.8; platform_system != "Windows"
