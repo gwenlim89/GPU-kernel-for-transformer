@@ -189,6 +189,17 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._kv_cache_enabled = False
         self._kv_cache: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._kv_cache_length = 0
+        self._mixed_precision_dtype: Optional[torch.dtype] = None
+
+    def enable_mixed_precision(
+        self, dtype: Optional[torch.dtype] = torch.float16
+    ) -> None:
+        """Use CUDA autocast for GEMMs and attention; pass None to disable."""
+        if dtype not in (None, torch.float16, torch.bfloat16):
+            raise ValueError("mixed precision dtype must be float16 or bfloat16")
+        if self._kv_cache_length:
+            raise RuntimeError("reset the KV cache before changing precision")
+        self._mixed_precision_dtype = dtype
 
     def enable_kv_cache(self, enabled: bool = True) -> None:
         """Enable incremental decoding, clearing any previous sequence."""
@@ -410,6 +421,20 @@ class UserOptimizedTransformer(BaselineTransformer):
             if self._kv_cache_enabled:
                 raise RuntimeError("KV caching is implemented for CUDA inference")
             return super().forward(x, valid_token_mask)
+
+        if self._mixed_precision_dtype is not None:
+            with torch.autocast(
+                device_type="cuda", dtype=self._mixed_precision_dtype
+            ):
+                return self._forward_cuda(x, valid_token_mask)
+        return self._forward_cuda(x, valid_token_mask)
+
+    def _forward_cuda(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """CUDA implementation, optionally entered under an autocast context."""
 
         if self._kv_cache_enabled and valid_token_mask is not None:
             if not bool(valid_token_mask.all().item()):
@@ -840,6 +865,12 @@ def parse_args() -> argparse.Namespace:
         choices=("float32", "float16", "bfloat16"),
         default="float32",
     )
+    parser.add_argument(
+        "--mixed-precision",
+        choices=("none", "float16", "bfloat16"),
+        default="none",
+        help="autocast only the optimized CUDA model to this compute dtype",
+    )
     parser.add_argument("--padding-ratio", type=float, default=0.0)
     parser.add_argument("--input-scale", type=float, default=1.0)
 
@@ -890,6 +921,8 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("repeats and benchmark_rounds must be positive")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
+    if args.mixed_precision != "none" and device.type != "cuda":
+        raise ValueError("--mixed-precision requires a CUDA device")
 
 
 def main() -> int:
@@ -926,6 +959,8 @@ def main() -> int:
 
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
+    if args.mixed_precision != "none":
+        optimized.enable_mixed_precision(resolve_dtype(args.mixed_precision))
 
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
@@ -934,6 +969,7 @@ def main() -> int:
     print("=== Configuration ===")
     print(config)
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
+    print(f"optimized_mixed_precision={args.mixed_precision}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
 
