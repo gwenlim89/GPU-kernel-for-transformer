@@ -195,7 +195,7 @@ class UserOptimizedTransformer(BaselineTransformer):
             valid_token_mask.device.index,
             valid_token_mask.data_ptr(),
             tuple(valid_token_mask.shape),
-            valid_token_mask._version,
+            valid_token_mask.is_inference(),
         )
         cached_masks = getattr(self, "_optimized_mask_cache", None)
         if cached_masks is None:
