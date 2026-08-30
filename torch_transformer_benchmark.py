@@ -14,7 +14,6 @@ The default thresholds are atol=0.001 and rtol=0.01 (1%).
 from __future__ import annotations
 
 import argparse
-import copy
 import math
 import statistics
 import time
@@ -172,7 +171,79 @@ class BaselineTransformer(nn.Module):
         return x
 
 
-class UserOptimizedTransformer(BaselineTransformer):
+class OptimizedSelfAttention(nn.Module):
+    """Packed-QKV dense self-attention for the optimized Transformer block."""
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        # gpt-fast uses one packed QKV projection; doing the same here removes
+        # three separate projection launches while preserving dense attention.
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        is_causal: bool,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(
+            batch, seq_len, 3, self.num_heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(dim=0)
+
+        # Keep PyTorch SDPA so CUDA can select fused/memory-efficient attention
+        # kernels without changing the required dense self-attention semantics.
+        context = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+        )
+        context = context.transpose(1, 2).reshape(batch, seq_len, self.d_model)
+        return self.out_proj(context)
+
+
+class OptimizedTransformerBlock(nn.Module):
+    """Pure block module shaped like gpt-fast, but with benchmark math intact."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attention = OptimizedSelfAttention(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn_in = nn.Linear(d_model, ffn_dim)
+        self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        is_causal: bool,
+    ) -> torch.Tensor:
+        attention_output = self.attention(self.norm1(x), attn_mask, is_causal)
+        # Tritonformer showed residual-add + following LayerNorm is the useful
+        # fusion target; keep this functional so regional compile can fuse it.
+        h = x + attention_output
+
+        hidden = self.ffn_in(self.norm2(h))
+        # Preserve the benchmark's exact GELU, not approximate GELU or SiLU.
+        hidden = F.gelu(hidden, approximate="none")
+        return h + self.ffn_out(hidden)
+
+
+class UserOptimizedTransformer(nn.Module):
     """
     Replace this class with the optimized implementation.
 
@@ -183,116 +254,36 @@ class UserOptimizedTransformer(BaselineTransformer):
     """
 
     def __init__(self, config: TransformerConfig) -> None:
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [
+                OptimizedTransformerBlock(
+                    config.d_model, config.num_heads, config.ffn_dim
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self._optimized_regions_compiled = False
 
         # Prebuild the causal part of the mask once. It is non-persistent so the
         # benchmark's strict weight copy still sees the same learnable state.
         causal_mask = torch.ones(config.seq_len, config.seq_len, dtype=torch.bool).tril()
         self.register_buffer("_optimized_causal_mask", causal_mask, persistent=False)
 
-        # Add a packed QKV projection for the optimized CUDA path. The original
-        # q_proj/k_proj/v_proj modules remain in place for weight compatibility.
-        for layer in self.layers:
-            layer.attention.qkv_proj = nn.Linear(
-                config.d_model, 3 * config.d_model, bias=True
-            )
-
-    def _refresh_packed_qkv(self) -> None:
-        # Copy the benchmark-loaded Q/K/V weights into qkv_proj once before
-        # inference, eliminating per-forward torch.cat/cache-key work.
-        with torch.no_grad():
-            for layer in self.layers:
-                attention = layer.attention
-                attention.qkv_proj.weight.copy_(
-                    torch.cat(
-                        (
-                            attention.q_proj.weight,
-                            attention.k_proj.weight,
-                            attention.v_proj.weight,
-                        ),
-                        dim=0,
-                    )
-                )
-                attention.qkv_proj.bias.copy_(
-                    torch.cat(
-                        (
-                            attention.q_proj.bias,
-                            attention.k_proj.bias,
-                            attention.v_proj.bias,
-                        ),
-                        dim=0,
-                    )
-                )
-
-    def _mask_has_padding(self, valid_token_mask: Optional[torch.Tensor]) -> bool:
-        if valid_token_mask is None:
-            return False
-
-        # Most no-padding benchmark cases still pass an all-True mask. Checking
-        # once lets the CUDA path skip mask construction and masked_fill work.
-        # Store the actual tensor object, not just data_ptr(), so a later tensor
-        # cannot accidentally inherit a stale cache entry from reused memory.
-        cached = getattr(self, "_optimized_mask_cache", None)
-        if cached is not None and cached[0] is valid_token_mask:
-            return cached[1]
-
-        has_padding = not bool(valid_token_mask.all().item())
-        self._optimized_mask_cache = (valid_token_mask, has_padding)
-        return has_padding
-
-    def _fast_attention(
-        self,
-        attention: BaselineSelfAttention,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
-        is_causal: bool,
-    ) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-
-        # One packed projection cuts launch overhead and memory traffic compared
-        # with separate q_proj/k_proj/v_proj calls.
-        qkv = attention.qkv_proj(x)
-        qkv = qkv.view(
-            batch, seq_len, 3, attention.num_heads, attention.head_dim
-        ).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(dim=0)
-
-        # On NVIDIA GPUs this can route to fused/memory-efficient attention
-        # kernels instead of materializing the full [B, H, S, S] scores/probs.
-        context = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=is_causal,
-        )
-        context = context.transpose(1, 2).reshape(batch, seq_len, attention.d_model)
-        # Do not clear padded query positions here. They cannot affect valid
-        # tokens, and forward() applies the reference-visible final mask once.
-        return attention.out_proj(context)
-
     def _attention_args(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
-        has_padding: bool,
     ) -> Tuple[Optional[torch.Tensor], bool, Optional[torch.Tensor]]:
         # SDPA bool masks use True for positions that are allowed to attend.
-        # Cache completed padding masks because the benchmark reuses the same
-        # immutable mask for all timed iterations.
-        if not has_padding:
+        # Do not inspect mask contents with .item(); None is the only fast-path
+        # signal, which keeps compiled execution free of data-dependent guards.
+        if valid_token_mask is None:
             return None, self.config.causal, None
 
         seq_len = x.shape[1]
-        cached = getattr(self, "_optimized_attention_mask_cache", None)
-        if (
-            cached is not None
-            and cached[0] is valid_token_mask
-            and cached[1] == seq_len
-        ):
-            return cached[2], cached[3], cached[4]
-
         key_mask = valid_token_mask[:, None, None, :]
         if not self.config.causal:
             attn_mask = key_mask
@@ -305,39 +296,17 @@ class UserOptimizedTransformer(BaselineTransformer):
         # Reuse the final padded-output mask as well, avoiding another boolean
         # inversion/allocation on every timed CUDA forward.
         invalid_output_mask = ~valid_token_mask[..., None]
-        self._optimized_attention_mask_cache = (
-            valid_token_mask,
-            seq_len,
-            attn_mask,
-            is_causal,
-            invalid_output_mask,
-        )
         return attn_mask, is_causal, invalid_output_mask
 
-    def _fast_block(
-        self,
-        layer: BaselineTransformerBlock,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
-        is_causal: bool,
-    ) -> torch.Tensor:
-        # Preserve the reference block formula while swapping in the faster
-        # attention implementation: LN -> attention -> residual, then FFN.
-        attention_output = self._fast_attention(
-            layer.attention,
-            layer.norm1(x),
-            attn_mask,
-            is_causal,
+    def compile_regions(self, mode: str) -> None:
+        if self._optimized_regions_compiled:
+            return
+        # Regional compilation follows PyTorch's repeated-layer pattern: compile
+        # each Transformer block instead of tracing the whole model at once.
+        self.layers = nn.ModuleList(
+            torch.compile(layer, mode=mode) for layer in self.layers
         )
-        x.add_(attention_output)
-
-        hidden = layer.ffn_in(layer.norm2(x))
-        # Keep exact GELU semantics, but write back into the temporary FFN
-        # activation so the CUDA path avoids one large hidden-tensor allocation.
-        F.gelu(hidden, approximate="none", out=hidden)
-        ffn_output = layer.ffn_out(hidden)
-        x.add_(ffn_output)
-        return x
+        self._optimized_regions_compiled = True
 
     def forward(
         self,
@@ -351,28 +320,17 @@ class UserOptimizedTransformer(BaselineTransformer):
         #   * Triton/CUDA fused kernels
         #   * fused LayerNorm / residual / FFN
         #
-        # Keep a baseline fallback for Mac/CPU runs; use the faster SDPA path
-        # on CUDA, where the RTX 3060 Laptop GPU can benefit from fused kernels.
-        if x.device.type != "cuda":
-            return super().forward(x, valid_token_mask)
-
-        # Compute the padding status once for the whole model. In the common
-        # all-valid case this skips per-layer mask creation and masked writes.
-        has_padding = self._mask_has_padding(valid_token_mask)
         attn_mask, is_causal, invalid_output_mask = self._attention_args(
-            x, valid_token_mask, has_padding
+            x, valid_token_mask
         )
 
-        # The benchmark reuses its input for many timing iterations. Clone once,
-        # then perform residual adds in place to reduce per-layer allocations.
-        x = x.clone()
         for layer in self.layers:
-            x = self._fast_block(layer, x, attn_mask, is_causal)
+            x = layer(x, attn_mask, is_causal)
         x = self.final_norm(x)
         if invalid_output_mask is not None:
             # This single final mask replaces the baseline's repeated padded
-            # writes; in-place fill avoids allocating another output tensor.
-            x.masked_fill_(invalid_output_mask, 0)
+            # writes while keeping the compiled block purely functional.
+            x = x.masked_fill(invalid_output_mask, 0)
         return x
         # ============================================================
 
@@ -381,28 +339,56 @@ def copy_model_weights(
     baseline: nn.Module, optimized: nn.Module, strict: bool = True
 ) -> None:
     """Copy identical weights into both implementations for a fair comparison."""
-    state_dict = copy.deepcopy(baseline.state_dict())
+    state_dict = baseline.state_dict()
 
     if isinstance(optimized, UserOptimizedTransformer):
-        # qkv_proj is an optimized-path copy of q_proj/k_proj/v_proj, so it is
-        # allowed to be missing from the baseline state dict and filled below.
-        incompatible = optimized.load_state_dict(state_dict, strict=False)
-        missing_keys = [
-            key
-            for key in incompatible.missing_keys
-            if ".qkv_proj." not in key
-        ]
-        if strict and (missing_keys or incompatible.unexpected_keys):
+        # The optimized model stores Q/K/V as one real packed parameter, so map
+        # the reference projections once instead of retaining duplicate modules.
+        missing_keys: List[str] = []
+        consumed_keys = set()
+        with torch.no_grad():
+            for key, target in optimized.state_dict().items():
+                if key.endswith(".attention.qkv_proj.weight"):
+                    prefix = key[: -len("qkv_proj.weight")]
+                    source_keys = (
+                        f"{prefix}q_proj.weight",
+                        f"{prefix}k_proj.weight",
+                        f"{prefix}v_proj.weight",
+                    )
+                    if any(source_key not in state_dict for source_key in source_keys):
+                        missing_keys.append(key)
+                        continue
+                    target.copy_(torch.cat([state_dict[k] for k in source_keys], dim=0))
+                    consumed_keys.update(source_keys)
+                elif key.endswith(".attention.qkv_proj.bias"):
+                    prefix = key[: -len("qkv_proj.bias")]
+                    source_keys = (
+                        f"{prefix}q_proj.bias",
+                        f"{prefix}k_proj.bias",
+                        f"{prefix}v_proj.bias",
+                    )
+                    if any(source_key not in state_dict for source_key in source_keys):
+                        missing_keys.append(key)
+                        continue
+                    target.copy_(torch.cat([state_dict[k] for k in source_keys], dim=0))
+                    consumed_keys.update(source_keys)
+                elif key in state_dict:
+                    target.copy_(state_dict[key])
+                    consumed_keys.add(key)
+                else:
+                    missing_keys.append(key)
+
+        unexpected_keys = [key for key in state_dict if key not in consumed_keys]
+        if strict and (missing_keys or unexpected_keys):
             raise RuntimeError(
                 "Error(s) in loading state_dict for UserOptimizedTransformer: "
-                f"missing={missing_keys}, unexpected={incompatible.unexpected_keys}"
+                f"missing={missing_keys}, unexpected={unexpected_keys}"
             )
         if not strict:
             if missing_keys:
                 print(f"[warning] missing optimized keys: {missing_keys}")
-            if incompatible.unexpected_keys:
-                print(f"[warning] unexpected keys: {incompatible.unexpected_keys}")
-        optimized._refresh_packed_qkv()
+            if unexpected_keys:
+                print(f"[warning] unexpected keys: {unexpected_keys}")
         return
 
     incompatible = optimized.load_state_dict(state_dict, strict=strict)
@@ -438,7 +424,7 @@ def generate_random_case(
     seed: int,
     padding_ratio: float,
     input_scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
@@ -453,10 +439,9 @@ def generate_random_case(
     x = x * input_scale
 
     if padding_ratio <= 0:
-        valid_token_mask = torch.ones(
-            config.batch_size, config.seq_len, device=device, dtype=torch.bool
-        )
-        return x, valid_token_mask
+        # No padding should be represented as None. This keeps the optimized
+        # path from building all-True masks or branching on tensor contents.
+        return x, None
 
     min_valid = max(1, int(round(config.seq_len * (1.0 - padding_ratio))))
     lengths = torch.randint(
@@ -663,7 +648,7 @@ class TimingResult:
 def warmup_model(
     model: nn.Module,
     x: torch.Tensor,
-    valid_mask: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
     iterations: int,
     device: torch.device,
 ) -> None:
@@ -674,10 +659,67 @@ def warmup_model(
         torch.cuda.synchronize(device)
 
 
+def timed_model_call(
+    model: nn.Module,
+    x: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    device: torch.device,
+) -> Tuple[torch.Tensor, float]:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
+    output = model(x, valid_mask)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    return output, elapsed_ms
+
+
+def run_benchmark_input_check(
+    baseline: nn.Module,
+    optimized: nn.Module,
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    padding_ratio: float,
+    input_scale: float,
+    rtol: float,
+    atol: float,
+) -> bool:
+    print("\n=== Benchmark-input correctness check ===")
+    print("first-call latency includes cold compile for enabled compiled models")
+    x, valid_mask = generate_random_case(
+        config=config,
+        device=device,
+        dtype=dtype,
+        seed=seed + 100000,
+        padding_ratio=padding_ratio,
+        input_scale=input_scale,
+    )
+
+    with torch.inference_mode():
+        reference, baseline_ms = timed_model_call(baseline, x, valid_mask, device)
+        candidate, optimized_ms = timed_model_call(optimized, x, valid_mask, device)
+
+    result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
+    status = "PASS" if result.passed else "FAIL"
+    print(
+        f"first call: baseline={baseline_ms:.4f} ms | "
+        f"optimized={optimized_ms:.4f} ms"
+    )
+    print(
+        f"fixed input: {status} | max_abs={result.max_abs_error:.6g} | "
+        f"max_rel={result.max_relative_error:.6g} | "
+        f"failed={result.failed_elements}/{result.total_elements}"
+    )
+    return result.passed
+
+
 def benchmark_once(
     model: nn.Module,
     x: torch.Tensor,
-    valid_mask: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
     iterations: int,
     device: torch.device,
 ) -> List[float]:
@@ -788,6 +830,9 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("this PyTorch build does not provide torch.compile")
+    if isinstance(model, UserOptimizedTransformer):
+        model.compile_regions(mode)
+        return model
     return torch.compile(model, mode=mode)
 
 
@@ -898,16 +943,14 @@ def main() -> int:
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
 
-    # Compile only after model construction, weight copy, device transfer, and eval().
-    baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
-    optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
-
     print("=== Configuration ===")
     print(config)
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
 
+    # Run eager correctness first. This keeps accuracy-test mask variation from
+    # causing compile graph breaks or recompiles before the fixed benchmark run.
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
         optimized=optimized,
@@ -927,9 +970,36 @@ def main() -> int:
         print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")
         return 2
 
+    # Compile only after eager accuracy, then validate the fixed benchmark input
+    # once so cold compile time stays out of the warm steady-state benchmark.
+    baseline_for_benchmark = maybe_compile(
+        baseline, args.compile_baseline, args.compile_mode
+    )
+    optimized_for_benchmark = maybe_compile(
+        optimized, args.compile_user, args.compile_mode
+    )
+    if args.compile_baseline or args.compile_user:
+        compiled_passed = run_benchmark_input_check(
+            baseline=baseline_for_benchmark,
+            optimized=optimized_for_benchmark,
+            config=config,
+            device=device,
+            dtype=dtype,
+            seed=args.seed,
+            padding_ratio=args.padding_ratio,
+            input_scale=args.input_scale,
+            rtol=args.rtol,
+            atol=args.atol,
+        )
+        accuracy_passed &= compiled_passed
+        if not compiled_passed and not args.benchmark_on_failure:
+            print("\nPerformance benchmark skipped because compiled validation failed.")
+            print("Use --benchmark-on-failure to benchmark an incorrect implementation anyway.")
+            return 2
+
     benchmark_models(
-        baseline=baseline,
-        optimized=optimized,
+        baseline=baseline_for_benchmark,
+        optimized=optimized_for_benchmark,
         config=config,
         device=device,
         dtype=dtype,
