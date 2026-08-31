@@ -582,9 +582,8 @@ An optional Chrome trace can be written with `--trace transformer_trace.json`.
 
 ## What could be improved with more time
 
-- **Run the true shape-14 reference elsewhere.** The streamed case is shape 14,
-  not shape 4. Shape 4 already executes its actual baseline. A 48-80 GiB GPU
-  could hold the full input/output for a complete optimized batch, but even it
+- **Run the true shape-14 reference elsewhere.** A 48-80 GiB GPU could
+  hold the full input/output for a complete optimized batch, but even it
   cannot materialize the current baseline's roughly 37.25 TiB of scores and
   probabilities. An exact blockwise/distributed reference or carefully
   designed CPU/offload implementation is required to obtain a meaningful full
