@@ -1,9 +1,9 @@
 """CUDA Graph support for fixed-input Transformer inference.
 
 CUDA Graphs replay an already-captured sequence of GPU kernels, reducing the
-CPU and driver launch overhead between small Transformer operations.  This
-wrapper intentionally targets a fixed tensor object and an all-valid mask.  If
-either input object changes, it transparently falls back to the eager model.
+CPU and driver launch overhead between small Transformer operations. This
+wrapper intentionally targets fixed input and mask objects. If either object
+changes, it transparently falls back to the eager model.
 """
 
 from __future__ import annotations
@@ -36,14 +36,18 @@ class FixedInputCUDAGraph(nn.Module):
             raise ValueError("CUDA Graph inputs must be CUDA tensors")
         if model.training:
             raise ValueError("CUDA Graph inference requires model.eval()")
-        if not bool(example_mask.all().item()):
-            raise ValueError("fixed-input CUDA Graph path requires an all-valid mask")
-
         self.model = model
         self._captured_x = example_x
         self._captured_mask = example_mask
         self._captured_x_version = _tensor_version(example_x)
         self._captured_mask_version = _tensor_version(example_mask)
+        if (
+            self._captured_x_version is None
+            or self._captured_mask_version is None
+        ):
+            raise ValueError(
+                "CUDA Graph inputs must expose mutation version counters"
+            )
         device = example_x.device
 
         # Warm up allocator, autocast, cuBLAS, and SDPA state on a side stream.
@@ -52,15 +56,15 @@ class FixedInputCUDAGraph(nn.Module):
         capture_stream.wait_stream(current_stream)
         with torch.inference_mode(), torch.cuda.stream(capture_stream):
             for _ in range(warmup_iterations):
-                model(example_x, None)
+                model(example_x, example_mask)
         current_stream.wait_stream(capture_stream)
         torch.cuda.synchronize(device)
 
         self._graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(self._graph):
-            # An all-True mask is semantically identical to no mask and avoids
-            # capturing mask inspection or host synchronization.
-            self._captured_output = model(example_x, None)
+            # Mask preprocessing was cached by warmup. Capture consumes only
+            # GPU tensors and contains no mask-related host synchronization.
+            self._captured_output = model(example_x, example_mask)
         torch.cuda.synchronize(device)
 
     def _matches_capture(
@@ -102,14 +106,15 @@ def maybe_cuda_graph(
         return model, False, "CUDA Graphs require a CUDA input"
     if not hasattr(torch.cuda, "CUDAGraph"):
         return model, False, "this PyTorch build has no CUDA Graph support"
-    if not bool(valid_token_mask.all().item()):
-        return model, False, "padding masks use the eager optimized path"
+    if bool(getattr(model, "_uses_internal_cuda_graphs", False)):
+        reason = str(getattr(model, "graph_status", "internal CUDA Graph replay"))
+        return model, True, reason
     if bool(getattr(model, "_kv_cache_enabled", False)):
         return model, False, "stateful KV-cache decoding uses the eager path"
 
     try:
         with torch.inference_mode():
-            eager_output = model(x, None)
+            eager_output = model(x, valid_token_mask)
         wrapped = FixedInputCUDAGraph(model, x, valid_token_mask)
         with torch.inference_mode():
             graph_output = wrapped(x, valid_token_mask)

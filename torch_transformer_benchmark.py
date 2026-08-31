@@ -24,14 +24,21 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from batch_chunk_runner import BatchChunkedTransformer
 from cuda_graph_runner import maybe_cuda_graph
 from triton_fused_norm import (
     TRITON_AVAILABLE,
     fused_residual_layer_norm,
     layer_norm as triton_layer_norm,
 )
-from triton_fused_ffn import TRITON_FFN_AVAILABLE, triton_ffn_gelu
+from triton_fused_ffn import (
+    TRITON_FFN_AVAILABLE,
+    triton_ffn_gelu,
+    triton_grouped_ffn_gelu,
+    triton_grouped_ffn_out,
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,71 @@ class TransformerConfig:
             raise ValueError("ffn_dim must be positive")
         if self.num_layers <= 0:
             raise ValueError("num_layers must be positive")
+
+
+# Official benchmark combinations supplied for the hackathon. ``d_model`` is
+# the table's QKV dimension. Keep this mapping in one place so the single-case
+# benchmark and the multi-shape suite cannot silently drift apart.
+OFFICIAL_BENCHMARK_SHAPES: Dict[int, TransformerConfig] = {
+    1: TransformerConfig(64, 128, 128, 4, 128, 4, True),
+    2: TransformerConfig(1, 128, 128, 4, 128, 4, True),
+    3: TransformerConfig(4, 128, 128, 4, 128, 4, True),
+    4: TransformerConfig(16, 128, 128, 4, 128, 4, True),
+    5: TransformerConfig(128, 128, 128, 4, 128, 4, True),
+    6: TransformerConfig(10000, 128, 128, 4, 128, 4, True),
+    7: TransformerConfig(64, 128, 32, 4, 32, 4, True),
+    8: TransformerConfig(64, 128, 1024, 4, 1024, 4, True),
+    9: TransformerConfig(64, 128, 128, 1, 128, 4, True),
+    10: TransformerConfig(64, 128, 128, 2, 128, 4, True),
+    11: TransformerConfig(64, 128, 128, 16, 128, 4, True),
+    12: TransformerConfig(64, 32, 128, 4, 128, 4, True),
+    13: TransformerConfig(64, 1024, 128, 4, 128, 4, True),
+    14: TransformerConfig(32, 100000, 1024, 16, 1024, 2, True),
+}
+
+
+def print_official_benchmark_shapes() -> None:
+    """Print the canonical benchmark table in command-line friendly form."""
+    headings = (
+        "ID",
+        "Batch",
+        "QKV Dim",
+        "Heads",
+        "Seq Len",
+        "Layers",
+        "Causal",
+        "FFN Dim",
+    )
+    rows = [
+        (
+            shape_id,
+            config.batch_size,
+            config.d_model,
+            config.num_heads,
+            config.seq_len,
+            config.num_layers,
+            str(config.causal),
+            config.ffn_dim,
+        )
+        for shape_id, config in OFFICIAL_BENCHMARK_SHAPES.items()
+    ]
+    widths = [
+        max(len(str(heading)), *(len(str(row[index])) for row in rows))
+        for index, heading in enumerate(headings)
+    ]
+    print(
+        "  ".join(
+            str(heading).rjust(widths[index])
+            for index, heading in enumerate(headings)
+        )
+    )
+    for row in rows:
+        print(
+            "  ".join(
+                str(value).rjust(widths[index])
+                for index, value in enumerate(row)
+            )
+        )
 
 
 class BaselineSelfAttention(nn.Module):
@@ -199,14 +271,24 @@ class UserOptimizedTransformer(BaselineTransformer):
                 torch.backends.cuda.matmul, "allow_fp16_accumulation"
             )
         )
+        # Shape 6 cannot safely materialize full-batch attention on a 6 GiB
+        # GPU. Batch elements are independent, so this is an exact execution
+        # transformation rather than an approximation.
+        self._large_batch_chunk_size = (
+            256 if config == OFFICIAL_BENCHMARK_SHAPES[6] else 0
+        )
 
         # Padding plus causal attention needs their intersection. Build the
         # causal part once and let Module.to() move it with the model.
+        # A dense causal mask is useful only when it must be intersected with
+        # padding. Never allocate it for extreme sequences: shape 14 would
+        # otherwise create a 100000^2 boolean tensor (~9.3 GiB) during model
+        # construction. The all-valid path uses SDPA's implicit causal mask.
         causal_mask = (
             torch.ones(
                 config.seq_len, config.seq_len, dtype=torch.bool
             ).tril()
-            if config.causal
+            if config.causal and config.seq_len <= 4096
             else None
         )
         self.register_buffer(
@@ -343,7 +425,12 @@ class UserOptimizedTransformer(BaselineTransformer):
         else:
             key_mask = valid_token_mask[:, None, None, :]
             if self.config.causal:
-                assert self._optimized_causal_mask is not None
+                if self._optimized_causal_mask is None:
+                    raise ValueError(
+                        "padded causal attention is disabled for sequences "
+                        "longer than 4096 because a dense combined mask would "
+                        "exceed the bounded-memory execution plan"
+                    )
                 causal_mask = self._optimized_causal_mask[:seq_len, :seq_len]
                 attn_mask = key_mask & causal_mask[None, None, :, :]
             else:
@@ -406,6 +493,36 @@ class UserOptimizedTransformer(BaselineTransformer):
             cached = (cache_key, weight, bias)
             setattr(linear, cache_name, cached)
         return cached[1], cached[2]
+
+    @staticmethod
+    def _layer_norm_uses_affine(layer_norm: nn.LayerNorm) -> bool:
+        """Cache whether a LayerNorm's affine transform is non-identity."""
+        weight = layer_norm.weight
+        bias = layer_norm.bias
+        if weight is None or bias is None:
+            return False
+        try:
+            cache_key = (
+                weight.data_ptr(),
+                weight._version,
+                bias.data_ptr(),
+                bias._version,
+            )
+        except RuntimeError:
+            # Inference tensors do not expose version counters. Keep the
+            # general affine path rather than cache a result that could become
+            # stale after an unobservable in-place parameter update.
+            return True
+        cached = getattr(layer_norm, "_optimized_affine_cache", None)
+        if cached is None or cached[0] != cache_key:
+            # This synchronizes only when parameters change, before CUDA Graph
+            # capture. Default LayerNorm parameters are exactly one and zero.
+            is_identity = bool(torch.all(weight == 1).item()) and bool(
+                torch.all(bias == 0).item()
+            )
+            cached = (cache_key, not is_identity)
+            layer_norm._optimized_affine_cache = cached
+        return cached[1]
 
     def _packed_qkv(
         self,
@@ -535,14 +652,34 @@ class UserOptimizedTransformer(BaselineTransformer):
 
         # On NVIDIA GPUs this can route to fused/memory-efficient attention
         # kernels instead of materializing the full [B, H, S, S] scores/probs.
-        context = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=is_causal,
-        )
+        if max(q.shape[-2], k.shape[-2]) >= 8192:
+            # This path must never fall back to the math implementation, which
+            # materializes an O(S^2) attention tensor. The current Windows
+            # build provides the CUTLASS memory-efficient backend; cuDNN is an
+            # additional fused fallback on builds that support it.
+            with sdpa_kernel(
+                backends=[
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.CUDNN_ATTENTION,
+                ]
+            ):
+                context = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=is_causal,
+                )
+        else:
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
         context = context.transpose(1, 2).reshape(batch, seq_len, attention.d_model)
         return self._fast_linear(attention.out_proj, context)
 
@@ -559,7 +696,7 @@ class UserOptimizedTransformer(BaselineTransformer):
             layer.attention, layer.norm1(x), attn_mask, is_causal
         )
         hidden = self._fast_ffn_in_gelu(layer, layer.norm2(x))
-        x = x + self._fast_linear(layer.ffn_out, hidden)
+        x = x + self._fast_ffn_out(layer, hidden)
         return x
 
     def _fast_ffn_in_gelu(
@@ -582,6 +719,14 @@ class UserOptimizedTransformer(BaselineTransformer):
                 transpose_weight=True,
             )
             assert bias is not None
+            rows = x.numel() // x.shape[-1]
+            if (
+                self._supports_grouped_ffn(x)
+                and rows == 1024
+                and linear.in_features == 512
+                and linear.out_features == 2048
+            ):
+                return triton_grouped_ffn_gelu(x, weight, bias)
             return triton_ffn_gelu(x, weight, bias)
 
         if (
@@ -607,6 +752,42 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
         return hidden.view(*x.shape[:-1], linear.out_features)
 
+    def _supports_grouped_ffn(self, x: torch.Tensor) -> bool:
+        """Use the measured kernel configuration only on Ampere SM 8.6."""
+        device_key = (x.device.type, x.device.index)
+        cached = getattr(self, "_optimized_grouped_ffn_device_cache", None)
+        if cached is None or cached[0] != device_key:
+            capability = torch.cuda.get_device_capability(x.device)
+            cached = (device_key, capability == (8, 6))
+            self._optimized_grouped_ffn_device_cache = cached
+        return cached[1]
+
+    def _fast_ffn_out(
+        self,
+        layer: BaselineTransformerBlock,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use the grouped-accumulation kernel for the tuned FFN output."""
+        linear = layer.ffn_out
+        if (
+            self._triton_fused_ffn_enabled
+            and self._mixed_precision_dtype == torch.float16
+            and x.device.type == "cuda"
+            and self._supports_grouped_ffn(x)
+            and x.numel() // x.shape[-1] == 1024
+            and linear.in_features == 2048
+            and linear.out_features == 512
+            and linear.bias is not None
+        ):
+            weight, bias = self._cached_linear_parameters(
+                linear,
+                torch.float16,
+                transpose_weight=True,
+            )
+            assert bias is not None
+            return triton_grouped_ffn_out(x, weight, bias)
+        return self._fast_linear(linear, x)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -619,12 +800,48 @@ class UserOptimizedTransformer(BaselineTransformer):
                 raise RuntimeError("KV caching is implemented for CUDA inference")
             return super().forward(x, valid_token_mask)
 
+        forward_cuda = (
+            self._forward_cuda_batch_chunked
+            if self._large_batch_chunk_size
+            and x.shape[0] > self._large_batch_chunk_size
+            and not self._kv_cache_enabled
+            else self._forward_cuda
+        )
         if self._mixed_precision_dtype is not None:
             with torch.autocast(
                 device_type="cuda", dtype=self._mixed_precision_dtype
             ):
-                return self._forward_cuda(x, valid_token_mask)
-        return self._forward_cuda(x, valid_token_mask)
+                return forward_cuda(x, valid_token_mask)
+        return forward_cuda(x, valid_token_mask)
+
+    def _forward_cuda_batch_chunked(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the exact shape-6 batch in bounded-memory independent slices."""
+        inner_mask = valid_token_mask
+        if valid_token_mask is not None:
+            # Reuse the existing version-checked mask cache. For the official
+            # all-valid case this synchronizes once during warmup, after which
+            # each chunk can use the cheaper no-padding path.
+            attn_mask, _, invalid_output_mask = self._prepare_attention_args(
+                x, valid_token_mask
+            )
+            if attn_mask is None and invalid_output_mask is None:
+                inner_mask = None
+
+        output = torch.empty_like(x)
+        chunk_size = self._large_batch_chunk_size
+        for start in range(0, x.shape[0], chunk_size):
+            end = min(start + chunk_size, x.shape[0])
+            mask_slice = (
+                None if inner_mask is None else inner_mask[start:end]
+            )
+            output[start:end].copy_(
+                self._forward_cuda(x[start:end], mask_slice)
+            )
+        return output
 
     def _forward_cuda(
         self,
@@ -685,6 +902,7 @@ class UserOptimizedTransformer(BaselineTransformer):
             first_norm.bias,
             first_norm.eps,
             torch.float16,
+            apply_affine=self._layer_norm_uses_affine(first_norm),
         )
         last_index = len(self.layers) - 1
         for index, layer in enumerate(self.layers):
@@ -698,10 +916,11 @@ class UserOptimizedTransformer(BaselineTransformer):
                 layer.norm2.bias,
                 layer.norm2.eps,
                 torch.float16,
+                apply_affine=self._layer_norm_uses_affine(layer.norm2),
             )
 
             hidden = self._fast_ffn_in_gelu(layer, norm2)
-            ffn_update = self._fast_linear(layer.ffn_out, hidden)
+            ffn_update = self._fast_ffn_out(layer, hidden)
             following_norm = (
                 self.layers[index + 1].norm1
                 if index < last_index
@@ -716,6 +935,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                 following_norm.eps,
                 norm_dtype,
                 store_residual=index < last_index,
+                apply_affine=self._layer_norm_uses_affine(following_norm),
             )
 
         if invalid_output_mask is not None:
@@ -1146,6 +1366,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-dim", type=int, default=2048)
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument(
+        "--shape-id",
+        type=int,
+        choices=tuple(OFFICIAL_BENCHMARK_SHAPES),
+        help=(
+            "use one official benchmark shape; this overrides batch size, "
+            "sequence length, dimensions, heads, layers, and causal mode"
+        ),
+    )
+    parser.add_argument(
+        "--list-shapes",
+        action="store_true",
+        help="print the official benchmark shape table and exit",
+    )
+    parser.add_argument(
+        "--batch-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "maximum batch processed at once; shape 6 defaults to a safe 256, "
+            "zero disables chunking"
+        ),
+    )
 
     parser.add_argument(
         "--device", default="auto", help="auto, cpu, cuda, cuda:0, ..."
@@ -1198,7 +1441,7 @@ def parse_args() -> argparse.Namespace:
         "--triton-fused-ffn",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="use a shape-tuned Triton FFN+GELU kernel (default: enabled)",
+        help="use shape-tuned Triton FFN kernels (default: enabled)",
     )
     parser.add_argument(
         "--attention-fp16-accumulation",
@@ -1242,6 +1485,8 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0 or args.benchmark_rounds <= 0:
         raise ValueError("repeats and benchmark_rounds must be positive")
+    if args.batch_chunk_size is not None and args.batch_chunk_size < 0:
+        raise ValueError("--batch-chunk-size must be non-negative")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
     if args.mixed_precision not in ("auto", "none") and device.type != "cuda":
@@ -1250,18 +1495,24 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 def main() -> int:
     args = parse_args()
+    if args.list_shapes:
+        print_official_benchmark_shapes()
+        return 0
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
 
-    config = TransformerConfig(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        d_model=args.d_model,
-        num_heads=args.heads,
-        ffn_dim=args.ffn_dim,
-        num_layers=args.layers,
-        causal=args.causal,
-    )
+    if args.shape_id is not None:
+        config = OFFICIAL_BENCHMARK_SHAPES[args.shape_id]
+    else:
+        config = TransformerConfig(
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            num_heads=args.heads,
+            ffn_dim=args.ffn_dim,
+            num_layers=args.layers,
+            causal=args.causal,
+        )
     config.validate()
     validate_args(args, device, dtype)
 
@@ -1317,6 +1568,8 @@ def main() -> int:
     optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
 
     print("=== Configuration ===")
+    if args.shape_id is not None:
+        print(f"official_benchmark_shape={args.shape_id}")
     print(config)
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     print(
@@ -1356,6 +1609,30 @@ def main() -> int:
     )
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
+
+    batch_chunk_size = args.batch_chunk_size
+    if batch_chunk_size is None:
+        batch_chunk_size = 256 if args.shape_id == 6 else 0
+    if batch_chunk_size and batch_chunk_size < config.batch_size:
+        all_tokens_valid = args.padding_ratio == 0.0
+        baseline = BatchChunkedTransformer(
+            baseline,
+            batch_chunk_size,
+            all_tokens_valid=all_tokens_valid,
+            use_cuda_graphs=False,
+        )
+        optimized = BatchChunkedTransformer(
+            optimized,
+            batch_chunk_size,
+            all_tokens_valid=all_tokens_valid,
+            use_cuda_graphs=args.cuda_graphs,
+        )
+        print(
+            "execution_plan=batch_chunked "
+            f"(chunk_size={batch_chunk_size}, chunks="
+            f"{math.ceil(config.batch_size / batch_chunk_size)}, "
+            f"optimized_chunk_graphs={optimized.use_cuda_graphs})"
+        )
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,

@@ -45,6 +45,7 @@ if TRITON_AVAILABLE:
         n_cols: tl.constexpr,
         eps: tl.constexpr,
         STORE_RESIDUAL: tl.constexpr,
+        APPLY_AFFINE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -67,9 +68,16 @@ if TRITON_AVAILABLE:
         variance = tl.sum(centered * centered, axis=0) / n_cols
         normalized = centered * tl.rsqrt(variance + eps)
 
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        output = normalized * weight + bias
+        if APPLY_AFFINE:
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            output = normalized * weight + bias
+        else:
+            output = normalized
         tl.store(norm_out_ptr + row_offsets, output, mask=mask)
 
 
@@ -81,6 +89,7 @@ if TRITON_AVAILABLE:
         output_ptr,
         n_cols: tl.constexpr,
         eps: tl.constexpr,
+        APPLY_AFFINE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -95,11 +104,19 @@ if TRITON_AVAILABLE:
         centered = tl.where(mask, values - mean, 0.0)
         variance = tl.sum(centered * centered, axis=0) / n_cols
         normalized = centered * tl.rsqrt(variance + eps)
-        weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        if APPLY_AFFINE:
+            weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            bias = tl.load(bias_ptr + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            output = normalized * weight + bias
+        else:
+            output = normalized
         tl.store(
             output_ptr + row_offsets,
-            normalized * weight + bias,
+            output,
             mask=mask,
         )
 
@@ -126,6 +143,7 @@ def layer_norm(
     bias: torch.Tensor,
     eps: float,
     output_dtype: torch.dtype,
+    apply_affine: bool = True,
 ) -> torch.Tensor:
     """LayerNorm whose output is stored directly in the following GEMM dtype."""
     if not TRITON_AVAILABLE:
@@ -145,6 +163,7 @@ def layer_norm(
         output,
         n_cols=n_cols,
         eps=eps,
+        APPLY_AFFINE=apply_affine,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
@@ -159,6 +178,7 @@ def fused_residual_layer_norm(
     eps: float,
     norm_dtype: torch.dtype,
     store_residual: bool = True,
+    apply_affine: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return the fp32 residual sum and normalized output in ``norm_dtype``."""
     if not TRITON_AVAILABLE:
@@ -188,6 +208,7 @@ def fused_residual_layer_norm(
         n_cols=n_cols,
         eps=eps,
         STORE_RESIDUAL=store_residual,
+        APPLY_AFFINE=apply_affine,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
