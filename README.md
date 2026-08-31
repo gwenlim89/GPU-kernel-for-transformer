@@ -13,6 +13,20 @@ attention backend, and the two extreme cases require memory-aware execution.
 The implementation therefore keeps one safe general path and adds narrowly
 measured dispatch for shapes 6, 8, 11, and 14.
 
+## Test it yourself
+
+After completing the setup below and activating `.venv`, run the benchmark
+suite from the project directory:
+
+```powershell
+python benchmark_shape_suite.py --quick --cases all
+```
+
+This is the recommended entry point for testing the project. It benchmarks
+shapes 1-13 against the exact baseline and runs the safe bounded proxy for
+shape 14. To test selected cases, replace `all` with a range or comma-separated
+list, such as `--cases 1-6` or `--cases 6,8,14`.
+
 ## Latest result
 
 On the test laptop described below, the latest complete quick sweep produced a
