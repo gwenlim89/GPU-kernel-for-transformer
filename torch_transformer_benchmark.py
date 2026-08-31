@@ -38,6 +38,9 @@ from triton_fused_ffn import (
     triton_ffn_gelu,
     triton_grouped_ffn_gelu,
     triton_grouped_ffn_out,
+    triton_grouped_qkv_1024,
+    triton_grouped_square_1024_gelu,
+    triton_grouped_square_1024_out,
 )
 
 
@@ -90,6 +93,68 @@ OFFICIAL_BENCHMARK_SHAPES: Dict[int, TransformerConfig] = {
     13: TransformerConfig(64, 1024, 128, 4, 128, 4, True),
     14: TransformerConfig(32, 100000, 1024, 16, 1024, 2, True),
 }
+
+
+@dataclass(frozen=True)
+class ShapeExecutionPlan:
+    """Measured kernel choices for one exact official benchmark shape."""
+
+    official_shape_id: Optional[int]
+    ffn_strategy: str = "generic_triton"
+    attention_strategy: str = "automatic"
+    projection_strategy: str = "native"
+    batch_chunk_size: int = 0
+
+    def describe(self) -> str:
+        shape = (
+            f"official-{self.official_shape_id}"
+            if self.official_shape_id is not None
+            else "general"
+        )
+        chunk = (
+            f", batch_chunk={self.batch_chunk_size}"
+            if self.batch_chunk_size
+            else ""
+        )
+        return (
+            f"{shape}: ffn={self.ffn_strategy}, "
+            f"attention={self.attention_strategy}, "
+            f"projections={self.projection_strategy}{chunk}"
+        )
+
+
+_OFFICIAL_SHAPE_IDS_BY_CONFIG = {
+    config: shape_id for shape_id, config in OFFICIAL_BENCHMARK_SHAPES.items()
+}
+
+
+def resolve_shape_execution_plan(config: TransformerConfig) -> ShapeExecutionPlan:
+    """Select only hardware-validated specializations; retain safe fallbacks."""
+    shape_id = _OFFICIAL_SHAPE_IDS_BY_CONFIG.get(config)
+    return ShapeExecutionPlan(
+        official_shape_id=shape_id,
+        # The square-1024 grouped kernel wins for both the 8,192-row shape 8
+        # and the streamed 100,000-row shape 14. Other widths retain the
+        # autotuned fp32-accumulation Triton implementation.
+        ffn_strategy=(
+            "grouped_square_1024" if shape_id in (8, 14) else "generic_triton"
+        ),
+        # The Windows build has no Flash Attention. Efficient attention is a
+        # measured win for shape 11's unusual 16 heads x head_dim 8 geometry;
+        # automatic dispatch is already optimal for the other ordinary cases.
+        attention_strategy=(
+            "efficient" if shape_id == 11 else "automatic"
+        ),
+        # Shape 8's packed QKV and attention output projections use the same
+        # conservative short-accumulation approach as its square FFN. Shape 14
+        # remains native because attention projection tuning moved its full
+        # 100,000-token latency by less than one percent.
+        projection_strategy=(
+            "grouped_1024" if shape_id == 8 else "native"
+        ),
+        # Shape 6 is exact batch-independent computation in bounded slices.
+        batch_chunk_size=1024 if shape_id == 6 else 0,
+    )
 
 
 def print_official_benchmark_shapes() -> None:
@@ -257,6 +322,7 @@ class UserOptimizedTransformer(BaselineTransformer):
 
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config)
+        self._shape_execution_plan = resolve_shape_execution_plan(config)
         # Caching is opt-in: ordinary forward calls retain full-sequence
         # semantics, while cached calls return outputs for only the new tokens.
         self._kv_cache_enabled = False
@@ -275,7 +341,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         # GPU. Batch elements are independent, so this is an exact execution
         # transformation rather than an approximation.
         self._large_batch_chunk_size = (
-            256 if config == OFFICIAL_BENCHMARK_SHAPES[6] else 0
+            self._shape_execution_plan.batch_chunk_size
         )
 
         # Padding plus causal attention needs their intersection. Build the
@@ -294,6 +360,11 @@ class UserOptimizedTransformer(BaselineTransformer):
         self.register_buffer(
             "_optimized_causal_mask", causal_mask, persistent=False
         )
+
+    @property
+    def shape_execution_plan(self) -> ShapeExecutionPlan:
+        """Expose the immutable dispatch decision for diagnostics and tests."""
+        return self._shape_execution_plan
 
     def enable_mixed_precision(
         self, dtype: Optional[torch.dtype] = torch.float16
@@ -569,6 +640,38 @@ class UserOptimizedTransformer(BaselineTransformer):
             attention._optimized_qkv_cache = cached_qkv
         return cached_qkv[1], cached_qkv[2]
 
+    @staticmethod
+    def _transposed_packed_qkv(
+        attention: BaselineSelfAttention,
+        packed_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cache packed QKV in the KxN layout consumed by the Triton kernel."""
+        cached = getattr(attention, "_optimized_qkv_kn_cache", None)
+        # Retaining the source tensor prevents a stale hit if CUDA later reuses
+        # its data pointer after source parameters are updated and repacked.
+        if cached is None or cached[0] is not packed_weight:
+            cached = (packed_weight, packed_weight.t().contiguous())
+            attention._optimized_qkv_kn_cache = cached
+        return cached[1]
+
+    def _uses_grouped_attention_projections(
+        self,
+        attention: BaselineSelfAttention,
+        x: torch.Tensor,
+    ) -> bool:
+        """Gate the measured shape-8 QKV/output kernels and their fallback."""
+        return (
+            self._shape_execution_plan.projection_strategy == "grouped_1024"
+            and self._triton_fused_ffn_enabled
+            and self._mixed_precision_dtype == torch.float16
+            and x.device.type == "cuda"
+            and not self._kv_cache_enabled
+            and x.numel() // x.shape[-1] >= 8192
+            and attention.d_model == 1024
+            and attention.out_proj.bias is not None
+            and self._supports_shape_tuned_kernels(x)
+        )
+
     def _fast_linear(
         self,
         linear: nn.Linear,
@@ -621,10 +724,21 @@ class UserOptimizedTransformer(BaselineTransformer):
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         qkv_weight, qkv_bias = self._packed_qkv(attention)
+        use_grouped_projections = self._uses_grouped_attention_projections(
+            attention, x
+        )
 
         # One packed projection cuts launch overhead and memory traffic compared
-        # with separate q_proj/k_proj/v_proj calls.
-        qkv = F.linear(x, qkv_weight, qkv_bias)
+        # with separate q_proj/k_proj/v_proj calls. Shape 8 additionally uses a
+        # measured short-accumulation kernel for this unusually wide GEMM.
+        if use_grouped_projections:
+            qkv = triton_grouped_qkv_1024(
+                x,
+                self._transposed_packed_qkv(attention, qkv_weight),
+                qkv_bias,
+            )
+        else:
+            qkv = F.linear(x, qkv_weight, qkv_bias)
         qkv = qkv.view(
             batch, seq_len, 3, attention.num_heads, attention.head_dim
         ).permute(2, 0, 3, 1, 4)
@@ -671,6 +785,18 @@ class UserOptimizedTransformer(BaselineTransformer):
                     dropout_p=0.0,
                     is_causal=is_causal,
                 )
+        elif self._planned_efficient_attention_available(
+            q, k, v, attn_mask, is_causal
+        ):
+            with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                context = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=is_causal,
+                )
         else:
             context = F.scaled_dot_product_attention(
                 q,
@@ -681,6 +807,14 @@ class UserOptimizedTransformer(BaselineTransformer):
                 is_causal=is_causal,
             )
         context = context.transpose(1, 2).reshape(batch, seq_len, attention.d_model)
+        if use_grouped_projections:
+            weight, bias = self._cached_linear_parameters(
+                attention.out_proj,
+                torch.float16,
+                transpose_weight=True,
+            )
+            assert bias is not None
+            return triton_grouped_square_1024_out(context, weight, bias)
         return self._fast_linear(attention.out_proj, context)
 
     def _fast_block(
@@ -721,10 +855,19 @@ class UserOptimizedTransformer(BaselineTransformer):
             assert bias is not None
             rows = x.numel() // x.shape[-1]
             if (
-                self._supports_grouped_ffn(x)
-                and rows == 1024
+                self._shape_execution_plan.ffn_strategy
+                == "grouped_square_1024"
+                and self._supports_shape_tuned_kernels(x)
+                and rows >= 2048
+                and linear.in_features == 1024
+                and linear.out_features == 1024
+            ):
+                return triton_grouped_square_1024_gelu(x, weight, bias)
+            if (
+                rows == 1024
                 and linear.in_features == 512
                 and linear.out_features == 2048
+                and self._supports_shape_tuned_kernels(x)
             ):
                 return triton_grouped_ffn_gelu(x, weight, bias)
             return triton_ffn_gelu(x, weight, bias)
@@ -752,15 +895,63 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
         return hidden.view(*x.shape[:-1], linear.out_features)
 
-    def _supports_grouped_ffn(self, x: torch.Tensor) -> bool:
-        """Use the measured kernel configuration only on Ampere SM 8.6."""
+    def _supports_shape_tuned_kernels(self, x: torch.Tensor) -> bool:
+        """Use measured shape specializations only on the target SM 8.6 GPU."""
         device_key = (x.device.type, x.device.index)
-        cached = getattr(self, "_optimized_grouped_ffn_device_cache", None)
+        cached = getattr(self, "_optimized_shape_kernel_device_cache", None)
         if cached is None or cached[0] != device_key:
             capability = torch.cuda.get_device_capability(x.device)
             cached = (device_key, capability == (8, 6))
-            self._optimized_grouped_ffn_device_cache = cached
+            self._optimized_shape_kernel_device_cache = cached
         return cached[1]
+
+    def _planned_efficient_attention_available(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        is_causal: bool,
+    ) -> bool:
+        """Validate and cache shape 11's backend choice before graph capture."""
+        if (
+            self._shape_execution_plan.attention_strategy != "efficient"
+            or self._kv_cache_enabled
+            or q.shape[0] != self.config.batch_size
+            or q.shape[-2] != self.config.seq_len
+            or not self._supports_shape_tuned_kernels(q)
+        ):
+            return False
+
+        cache_key = (
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            q.dtype,
+            q.device,
+            attn_mask is not None,
+            is_causal,
+        )
+        cache = getattr(self, "_optimized_efficient_attention_cache", None)
+        if cache is None:
+            cache = {}
+            self._optimized_efficient_attention_cache = cache
+        if cache_key not in cache:
+            params_type = getattr(torch.backends.cuda, "SDPAParams", None)
+            checker = getattr(
+                torch.backends.cuda, "can_use_efficient_attention", None
+            )
+            if params_type is None or checker is None:
+                cache[cache_key] = False
+            else:
+                try:
+                    params = params_type(
+                        q, k, v, attn_mask, 0.0, is_causal, False
+                    )
+                    cache[cache_key] = bool(checker(params))
+                except (RuntimeError, TypeError):
+                    cache[cache_key] = False
+        return bool(cache[cache_key])
 
     def _fast_ffn_out(
         self,
@@ -773,19 +964,33 @@ class UserOptimizedTransformer(BaselineTransformer):
             self._triton_fused_ffn_enabled
             and self._mixed_precision_dtype == torch.float16
             and x.device.type == "cuda"
-            and self._supports_grouped_ffn(x)
-            and x.numel() // x.shape[-1] == 1024
-            and linear.in_features == 2048
-            and linear.out_features == 512
             and linear.bias is not None
         ):
-            weight, bias = self._cached_linear_parameters(
-                linear,
-                torch.float16,
-                transpose_weight=True,
+            is_square_1024 = (
+                self._shape_execution_plan.ffn_strategy
+                == "grouped_square_1024"
+                and x.numel() // x.shape[-1] >= 2048
+                and linear.in_features == 1024
+                and linear.out_features == 1024
             )
-            assert bias is not None
-            return triton_grouped_ffn_out(x, weight, bias)
+            is_legacy_tuned_shape = (
+                x.numel() // x.shape[-1] == 1024
+                and linear.in_features == 2048
+                and linear.out_features == 512
+            )
+            if (
+                (is_square_1024 or is_legacy_tuned_shape)
+                and self._supports_shape_tuned_kernels(x)
+            ):
+                weight, bias = self._cached_linear_parameters(
+                    linear,
+                    torch.float16,
+                    transpose_weight=True,
+                )
+                assert bias is not None
+                if is_square_1024:
+                    return triton_grouped_square_1024_out(x, weight, bias)
+                return triton_grouped_ffn_out(x, weight, bias)
         return self._fast_linear(linear, x)
 
     def forward(
@@ -1385,7 +1590,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "maximum batch processed at once; shape 6 defaults to a safe 256, "
+            "maximum batch processed at once; shape 6 defaults to a safe 1024, "
             "zero disables chunking"
         ),
     )
@@ -1525,6 +1730,14 @@ def main() -> int:
 
     baseline = BaselineTransformer(config)
     optimized = UserOptimizedTransformer(config)
+    shape_execution_plan = optimized.shape_execution_plan
+    batch_chunk_size = args.batch_chunk_size
+    if batch_chunk_size is None:
+        batch_chunk_size = shape_execution_plan.batch_chunk_size
+    # Keep direct calls and the outer benchmark wrapper on the same chunk
+    # geometry. This also makes --batch-chunk-size 0 genuinely disable the
+    # automatic shape-6 plan instead of leaving an inner split active.
+    optimized._large_batch_chunk_size = batch_chunk_size
     copy_model_weights(
         baseline,
         optimized,
@@ -1607,12 +1820,10 @@ def main() -> int:
         "optimized_attention_fp16_accumulation="
         f"{attention_fp16_accumulation_active}"
     )
+    print(f"optimized_shape_plan={shape_execution_plan.describe()}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
 
-    batch_chunk_size = args.batch_chunk_size
-    if batch_chunk_size is None:
-        batch_chunk_size = 256 if args.shape_id == 6 else 0
     if batch_chunk_size and batch_chunk_size < config.batch_size:
         all_tokens_valid = args.padding_ratio == 0.0
         baseline = BatchChunkedTransformer(

@@ -84,15 +84,12 @@ def make_models(config: TransformerConfig, seed: int):
 
 
 def proxy_accuracy(args: argparse.Namespace, device: torch.device) -> None:
-    config = TransformerConfig(
-        batch_size=1,
-        seq_len=args.proxy_seq_len,
-        d_model=1024,
-        num_heads=16,
-        ffn_dim=1024,
-        num_layers=2,
-        causal=True,
-    )
+    # Construct the official model so this bounded comparison exercises the
+    # exact shape-14 dispatch plan. Transformer weights are independent of
+    # batch/sequence length, so a B=1, shorter input remains a valid numerical
+    # proxy without weakening the kernel selection being tested.
+    config = OFFICIAL_BENCHMARK_SHAPES[SHAPE_ID]
+    sequence = args.proxy_seq_len
     baseline, optimized = make_models(config, args.seed)
     baseline = baseline.to(device).eval()
     optimized = optimized.to(device).eval()
@@ -100,12 +97,12 @@ def proxy_accuracy(args: argparse.Namespace, device: torch.device) -> None:
     generator = torch.Generator(device=device).manual_seed(args.seed)
     x = torch.randn(
         1,
-        config.seq_len,
+        sequence,
         config.d_model,
         device=device,
         generator=generator,
     )
-    mask = torch.ones(1, config.seq_len, device=device, dtype=torch.bool)
+    mask = torch.ones(1, sequence, device=device, dtype=torch.bool)
     with torch.inference_mode():
         reference = baseline(x, mask)
         candidate = optimized(x, mask)
@@ -113,7 +110,7 @@ def proxy_accuracy(args: argparse.Namespace, device: torch.device) -> None:
     print(
         "proxy_accuracy="
         f"{'PASS' if result.passed else 'FAIL'} "
-        f"sequence={config.seq_len} failed={result.failed_elements}/"
+        f"sequence={sequence} failed={result.failed_elements}/"
         f"{result.total_elements} max_abs={result.max_abs_error:.6g}"
     )
     if not result.passed:
@@ -130,15 +127,10 @@ def streamed_performance(
 ) -> None:
     torch.cuda.reset_peak_memory_stats(device)
     official = OFFICIAL_BENCHMARK_SHAPES[SHAPE_ID]
-    config = TransformerConfig(
-        batch_size=official.batch_size,
-        seq_len=sequence,
-        d_model=official.d_model,
-        num_heads=official.num_heads,
-        ffn_dim=official.ffn_dim,
-        num_layers=official.num_layers,
-        causal=True,
-    )
+    # Retain the official config even for a shorter proxy input so performance
+    # runs execute the same shape-selected kernels as the full 100,000-token
+    # stream. The actual tensor controls the runtime sequence length.
+    config = official
     _, optimized = make_models(config, args.seed)
     del _
     optimized = optimized.to(device).eval()

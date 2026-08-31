@@ -346,3 +346,66 @@ def triton_grouped_ffn_out(
         block_n=64,
         fuse_gelu=False,
     )
+
+
+def triton_grouped_square_1024_gelu(
+    inputs: torch.Tensor,
+    weight_kn: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Tuned square-1024 projection with a fused tanh-GELU epilogue.
+
+    The short accumulation groups deliberately trade a little tensor-core
+    throughput for enough fp32 promotion points to satisfy the benchmark's
+    elementwise accuracy rule.  This configuration is measured for the
+    official 8,192-row and streamed 100,000-row workloads on SM 8.6.
+    """
+    if inputs.shape[-1] != 1024 or weight_kn.shape != (1024, 1024):
+        raise ValueError("grouped square FFN+GELU expects 1024-to-1024")
+    return _grouped_accumulation_linear(
+        inputs,
+        weight_kn,
+        bias,
+        group_k=32,
+        block_m=64,
+        block_n=128,
+        fuse_gelu=True,
+    )
+
+
+def triton_grouped_square_1024_out(
+    inputs: torch.Tensor,
+    weight_kn: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Tuned square-1024 FFN output with conservative accumulation groups."""
+    if inputs.shape[-1] != 1024 or weight_kn.shape != (1024, 1024):
+        raise ValueError("grouped square FFN output expects 1024-to-1024")
+    return _grouped_accumulation_linear(
+        inputs,
+        weight_kn,
+        bias,
+        group_k=32,
+        block_m=64,
+        block_n=128,
+        fuse_gelu=False,
+    )
+
+
+def triton_grouped_qkv_1024(
+    inputs: torch.Tensor,
+    weight_kn: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Tuned packed 1024-to-3072 QKV projection for official shape 8."""
+    if inputs.shape[-1] != 1024 or weight_kn.shape != (1024, 3072):
+        raise ValueError("grouped packed QKV expects 1024-to-3072")
+    return _grouped_accumulation_linear(
+        inputs,
+        weight_kn,
+        bias,
+        group_k=32,
+        block_m=128,
+        block_n=128,
+        fuse_gelu=False,
+    )

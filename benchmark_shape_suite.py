@@ -253,7 +253,7 @@ def main() -> int:
                 )
             continue
 
-        batch_chunk_size = 256 if shape_id == 6 else None
+        batch_chunk_size = 1024 if shape_id == 6 else None
         estimate = estimated_reference_peak_bytes(config, batch_chunk_size)
         print(
             f"\n=== [{position}/{len(shape_ids)}] official shape {shape_id} ===",
@@ -319,7 +319,11 @@ def main() -> int:
     speedups = [result.speedup for result in results if result.speedup is not None]
     if speedups:
         geometric_mean = math.exp(statistics.fmean(math.log(x) for x in speedups))
-        print(f"geometric-mean speedup across completed cases: {geometric_mean:.3f}x")
+        throughput_gain = (geometric_mean - 1.0) * 100.0
+        print(
+            "geometric-mean speedup across completed cases: "
+            f"{geometric_mean:.3f}x ({throughput_gain:+.1f}% throughput)"
+        )
     failures = [result for result in results if result.status == "FAIL"]
     incomplete = [
         result for result in results if result.status in ("SKIP", "PROXY")
